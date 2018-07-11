@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>RT For DR</title>
+    <script src="js/RTDose.js"></script>
+    <script src="js/Image.js"></script>
+    <script src="js/Graphics.js"></script>
+    <script src="js/DoseSlice.js"></script>
+    <script src="js/jszip.min.js"></script>
+    <script src="js/FileSaver.min.js"></script>
+    <script src="js/Fuse.js"></script>
+    <script src="js/DicomDataSet.js"></script>
+    <script src="js/Matrices.js"></script>
+    <link rel="stylesheet" type="text/css" href="stylesheets/indexStyle.css">
+    <link rel="shortcut icon" href="https://medicine.wustl.edu/wp-content/themes/medicine/_/img/favicon.ico">
+    <link rel="apple-touch-icon" href="https://medicine.wustl.edu/wp-content/themes/medicine/_/img/apple-touch-icon.png">
+</head>
+<body>
+    <!--<div id="mriFiles">-->
+        <!--Image Files: <input type="file" id="mriInput" accept=".dcm" multiple>-->
+        <!--<div id="mriProgress">-->
+            <!--<br>-->
+        <!--</div>-->
+        <!--<br>-->
+    <!--</div>-->
+    <!--<div id="rtdoseFiles">-->
+        <!--RT Dose Files: <input type="file" id="rtdoseInput" accept=".dcm" multiple><br>-->
+        <!--<div id="rtdoseProgress">-->
+            <!--<br>-->
+        <!--</div>-->
+    <!--</div>-->
+    <div>
+        <div id="header">
+            <img id="wusm-logo" src="https://medicine.wustl.edu/wp-content/themes/medicine/_/img/header-logo.svg" onerror="this.src='https://medicine.wustl.edu/wp-content/themes/medicine/_/img/header-logo.png';this.onerror=null;" alt="Washington University School of Medicine in Saint Louis">
+        </div>
+        <div id="header-middle">
+            <div id="header-text">
+                RTForDR: Fuse Dose and CT Files
+            </div>
+        </div>
+        <div id="header-bottom"></div>
+    </div>
+    <div id="content">
+        <div id="chrome-warning"></div>
+        <div id="instructions">
+            <h1>Instructions</h1>
+            <ol>
+                <li>Click "Choose Files" below</li>
+                <li>Select the folder that the RTDose and CT files are in<span id="highlight-warning"></span></li>
+                <li>Wait. Your browser may freeze while the files are being written</li>
+            </ol>
+        </div>
+        <div id="program">
+            <div id="file-input">
+                DICOM files: <input type="file" id="all-file-input" webkitdirectory directory multiple accept="*.dcm"><br>
+            </div>
+            <div id="file-counters">
+                <div id="rt-file-counter"></div>
+                <div id="ct-file-counter"></div>
+                <div id="mri-file-counter"></div>
+                <div id="ignored-file-counter"></div>
+                <div id="file-progress"></div>
+                <div id="conversion-progress"></div>
+            </div>
+        </div>
+        <div id="blurb">
+            <h1>Purpose</h1>
+            <p>
+                In the 21<sup>st</sup> century, delivery of radiation is mostly image guided, however, not all of this image information is retained. Vital information on the location of the radiation doses cannot be stored in PACS databases. Without this information, physicians must make their “best guess” on the location of the dose, based on written notes, rather than making informed decisions based on high precision, computer-generated dose information. This lack of precision can have far-reaching consequences. For example, with only written notes, doctors could misdiagnose a patient, such as mistaking pneumonia for pneumonitis.
+            </p>
+            <p>
+                RTForDR is the solution to this consequential problem. RTForDR converts radiation dose information from DICOM-RT to the DICOM format, so that it can be stored in PACS databases and viewed with conventional DICOM viewing software.
+
+            </p>
+            <h1>Privacy of Information</h1>
+            <p>
+                RTForDR respects the privacy of private health information. All data manipulation is done locally, on your computer.
+                None of the files leave your computer, or can be viewed by anyone else during the conversion process.
+            </p>
+        </div>
+    </div>
+    <div id="footer">
+        <div id="bottom-footer"></div>
+    </div>
+</body>
+<script>
+    //todo:: note to self: Make a progress bar to say what % are processed, and also give how many RT DOSE and how many mri files there are
+
+    if(!window.chrome || !window.chrome.webstore) {
+        document.getElementById("chrome-warning").innerHTML = "<h2>RTForDR works best with Google Chrome <a href=\"https://www.google.com/chrome/browser/desktop/index.html\"><img src=\"https://www.google.com/chrome/assets/common/images/chrome_logo_2x.png\" alt=\"Google Chrome\" style=\"height:40px;vertical-align: middle;\"> </a></h2>";
+        document.getElementById("highlight-warning").innerHTML = ". Open the folder and select all of its contents using CTRL + A";
+    }
+
+    //browser is assumed little endian //todo:: make an error if it isnt
+    var shortArray = new Uint16Array([1]);
+    var toByteArray = new Uint8Array(shortArray.buffer);
+
+    //todo:: Verify that tehre are > 0 mri files and > 0 RTDose files
+    var rtdose = [],
+        images = [],
+//        convertButton = document.getElementById("convertButton"),
+        rtdoseInput = document.getElementById("rtdoseInput"),
+        MaxDose = 0;
+
+
+
+    var fileInput = document.getElementById("all-file-input"),
+        rtFileCounter = document.getElementById("rt-file-counter"),
+        ctFileCounter = document.getElementById("ct-file-counter"),
+        mriFileCounter = document.getElementById("mri-file-counter"),
+        ignoredFileCounter = document.getElementById("ignored-file-counter"),
+        fileProgress = document.getElementById("file-progress"),
+        conversionProgress = document.getElementById("conversion-progress");
+    fileInput.addEventListener("change", function(event) {
+        var reader = new FileReader(),
+            index = 0,
+            rtIndex = 0,
+            imageIndex = 0,
+            ignoredCounter = 0,
+            ctIndex = 0,
+            mriIndex = 0;
+        images = []; rtdose = []; MaxDose = 0;
+        rtFileCounter.innerHTML = "";
+        ctFileCounter.innerHTML = "";
+        mriFileCounter.innerHTML = "";
+        ignoredFileCounter.innerHTML = "";
+        fileProgress.innerHTML = "";
+        conversionProgress.innerHTML = "";
+        reader.onload = function() {
+            file = fileInput.files[index];
+            if(file.name.substring(file.name.length-4) === ".dcm") {
+                var dataSet = new DicomDataSet(new Uint8Array(reader.result));
+                if (dataSet.Modality === "RTDOSE") {
+                    //its an RTDose file
+                    try {
+                        rtdose[rtIndex] = new RTDose(dataSet);
+                        console.log(rtdose[rtIndex]);
+                        MaxDose += rtdose[rtIndex].MaxDose;
+                        rtIndex++;
+                        rtFileCounter.innerHTML = "" + rtIndex + " dose file" + (rtIndex === 1 ? "" : "s") + " found";
+                    }
+                    catch (e) {
+                        console.log(e);
+                    }
+                }
+                else if (dataSet.Modality === "MR" || dataSet.Modality === "CT"){
+                    try {
+                        //then its a CT/Image file
+                        images[imageIndex] = new Image(dataSet);
+                        imageIndex++;
+                        if(dataSet.Modality === "CT") {
+                            ctIndex++;
+                            ctFileCounter.innerHTML = "" + ctIndex + " CT file" + (ctIndex === 1 ? "" : "s") + " found";
+                        }
+                        else {
+                            mriIndex++;
+                            mriFileCounter.innerHTML = "" + mriIndex + " MRI file" + (mriIndex === 1 ? "" : "s") + " found";
+                        }
+//                        console.log(images[imageIndex-1]);
+                    }
+                    catch (e) {
+                        console.log(e);
+                    }
+                }
+                else {
+                    ignoredCounter++;
+                    ignoredFileCounter.innerHTML = "" + ignoredCounter + " non-DICOM file" + (ignoredCounter === 1 ? "" : "s") + " ignored";
+                }
+            }
+            else {
+                ignoredCounter++;
+                ignoredFileCounter.innerHTML = "" + ignoredCounter + " non-DICOM file" + (ignoredCounter === 1 ? "" : "s") + " ignored";
+            }
+            index++;
+            var progress = Math.round(index * 100 / fileInput.files.length);
+            fileProgress.innerHTML = "" + index + "/" + fileInput.files.length + " files processed (" + progress + "%)";
+            if (index < fileInput.files.length) {
+                //continue to read files
+                reader.readAsArrayBuffer(fileInput.files[index]);
+            }
+            else {
+                if(rtIndex <= 0) {
+                    alert("Error: No RTDose files selected. Please select the correct folder and try again.");
+                }
+                else {
+                    //end of file reading
+                    images.sort(function (a, b) {
+                        return a.SliceLocation - b.SliceLocation;
+                    });
+                    conversionProgress.innerHTML = "0/" + (2 * images.length) + " files written (0%)";
+                    doConvert();
+                }
+            }
+        };
+
+        reader.readAsArrayBuffer(fileInput.files.item(0));
+    });
+
+    //starts the proccess of converting. Could also be automated but I dont want to waste system resources with an automatic start to conversion if someone does not add all files at the exact same time.
+//    document.getElementById("convertButton").addEventListener("click", doConvert);
+
+    function doConvert() {
+        //todo:: ensure that this works accross browers https://github.com/eligrey/FileSaver.js/
+//        convertButton.disabled = true;
+//        var MinDose = MaxDose * document.getElementById("minDoseInput").value / 100; //sets the minimum dose that is visible
+        var MinDose = MaxDose * 0.15;
+        //han's method for UID's blindly followed
+        //for x combinations of UID's, in order to keep probability of there being at least one collision below p, n must be less than approximately sqrt(2*x*ln(1/(1-p)))
+        //in this case there are 2^65 possibilities, so as long as there are less than 600million uses of this application, we're good.
+        //https://en.wikipedia.org/wiki/Birthday_problem
+        var root = "1.4.6.1.4.1.1215.100.1.",
+//            seriesUid1 = root + Math.floor(Math.random()*0xFFFFFFFF) + "." + Math.floor(Math.random()*0xFFFFFFFF),
+//            seriesUid2 = root + Math.floor(Math.random()*0xFFFFFFFF) + "." + Math.floor(Math.random()*0xFFFFFFFF),
+//            impclassUid1 = root + Math.floor(Math.random()*0xFFFFFFFF) + "." + Math.floor(Math.random()*0xFFFFFFFF),
+//            impclassUid2 = root + Math.floor(Math.random()*0xFFFFFFFF) + "." + Math.floor(Math.random()*0xFFFFFFFF),
+            //new implementation allows for 10^36 possibilites, so the program is now safe up to ~10^17 uses. So we're basically safe.
+            seriesUid1 = encodeString(root + randBase10(39)), //todo: there's some room for (albeit minor) optimization here
+            seriesUid2 = encodeString(root + randBase10(39)),
+            impclassUid1 = encodeString(root + randBase10(39)),
+            impclassUid2 = encodeString(root + randBase10(39)),
+            sopuid1root = root + randBase10(37),
+            sopuid2root = root + randBase10(37),
+            //slices = new Array(images.length),
+            bigEndian = images[0].bigEndian,
+            date = new Date(),
+            zip = new JSZip();
+        zip.folder("RTtoMRI");
+        zip.folder("RT_MRI_FUSED");
+        function convertSlice(i) {
+
+            if (images[i] !== undefined && images[i] !== null) {
+                var sopuid1string = sopuid1root + formatSliceLocationId(i + 1),
+                    sopuid1 = encodeString(sopuid1string),
+                    sopuid2string =  sopuid2root + formatSliceLocationId(i + 1),
+                    sopuid2 = encodeString(sopuid2string);
+                var slice = new DoseSlice(images[i], rtdose, MaxDose);
+//                set(slice.mri.dataSet, "x0020000e", seriesUid1, bigEndian, false); //SeriesInstanceUID
+//                set(slice.mri.dataSet, "x00020012", impclassUid1, bigEndian, true); //ImplementationClassUID
+//                set(slice.mri.dataSet, "x00020003", sopuid1, bigEndian, true); //MediaStorageSOPInstanceUID
+//                set(slice.mri.dataSet, "x00080018", sopuid1, bigEndian, false); //SOPInstanceUID
+                slice.mri.dataSet.set("x0020000e", "UI", seriesUid1); //SeriesInstanceUID
+                slice.mri.dataSet.set("x00020012", "UI", impclassUid1); //ImplementationClassUID
+                slice.mri.dataSet.set("x00020003", "UI", sopuid1); //MediaStorageSOPInstanceUID
+                slice.mri.dataSet.set("x00080018", "UI", sopuid1); //SOPInstanceUID
+
+                var progress = 100 * (i + 1) / images.length;
+                //todo:: progress doesn't render until loop is finished. Figure out how to fix it eventually
+                zip.file("RTtoMRI/" + sopuid1string + ".dcm", slice.blob(), {
+                    date: date, //todo:: fix the date so a new date can be added, or so that it uses the original date of the Image as the default
+                    compression: "STORE" //todo:: Might want to do no compression
+                });
+
+                //now that the Image is saved, we can start messing with it's data inorder to create the FUSED thing, without screwing something up
+                var fusedSlice = new Fuse(slice, MinDose, MaxDose);
+
+//                set(fusedSlice.mri.dataSet, "x0020000e", seriesUid2, bigEndian, false); //SeriesInstanceUID
+////            set(fusedSlice.mri.dataSet, "x00020012", impclassUid2, bigEndian, true); //ImplementationClassUID
+//                set(fusedSlice.mri.dataSet, "x00020003", sopuid2, bigEndian, true); //MediaStorageSOPInstanceUID
+//                set(fusedSlice.mri.dataSet, "x00080018", sopuid2, bigEndian, false); //SOPInstanceUID
+                fusedSlice.mri.dataSet.set("x0020000e", "UI", seriesUid1); //SeriesInstanceUID
+                fusedSlice.mri.dataSet.set("x00020012", "UI", impclassUid1); //ImplementationClassUID
+                fusedSlice.mri.dataSet.set("x00020003", "UI", sopuid1); //MediaStorageSOPInstanceUID
+                fusedSlice.mri.dataSet.set("x00080018", "UI", sopuid1); //SOPInstanceUID
+
+                zip.file("RT_MRI_FUSED/" + sopuid2string + ".dcm", slice.blob(), {
+                    date: date, //todo:: Fix this as in the other one that saves "RTtoMRI" files
+                    compression: "STORE"
+                });
+                var timeRemaining = Math.floor(((new Date()) - startTime)/(i+1)*(images.length - i - 1)/1000);
+                conversionProgress.innerHTML = "" + (2*(i+1)) + "/" + (2*images.length) + " files written (" + Math.round(100*(i+1)/images.length)+ "%)<br>" +
+                     timeRemaining + " second" + (timeRemaining === 1 ? "" : "s") + " remaining";
+            }
+            else if (i >= images.length) {
+                var endTime = new Date();
+
+                console.log("Elapsed time for " + images.length + " slices: " + (endTime - startTime) + "ms");
+
+                conversionProgress.innerHTML = "" + (2*images.length) + "/" + (2*images.length) + " files written (100%)" +
+                        "<br>Complete. Downloading files...";
+
+                var startZip = new Date();
+
+
+                zip.generateAsync({
+                    compression:"STORE",
+                    type:"blob"
+                })
+                    .then(function(content) {
+                        saveAs(content, "RTForDR.zip");
+                    });
+
+//                convertButton.disabled = false;
+            }
+        }
+        var startTime = new Date();
+        for(var i = 0; i < images.length + 1; i++) {
+            setTimeout((function(x) {
+                return function() {
+                    convertSlice(x);
+                };
+            })(i), 4);
+        }
+    }
+
+    function formatSliceLocationId(id) {
+        var x = id.toString(10),
+            len = x.length;
+        for(var i = 0; i < 5-len; i++) {
+            x = "0" + x;
+        }
+        return x;
+    }
+
+    function randBase10(length) {
+        var out = "" + Math.floor(Math.random()*9+1);
+        for(var i = 1; i < length; i++) {
+            out += Math.floor(Math.random() * 10);
+        }
+        return out;
+    }
+
+    function findMaxMriValue(mris) {
+        for(var i = 0; i < mris.length; i++) {
+            if(mris[i].LargestPixelValueInSeries !== undefined && !isNaN(mris[i].LargestPixelValueInSeries)) {
+                return mris[i].LargestPixelValueInSeries;
+            }
+        }
+
+        var max = 0;
+        for(var i = 0; i < mris.length; i++) {
+            var maxInSlice = max2(mris[i].PixelData);
+            if(maxInSlice > max) {
+                max = maxInSlice;
+            }
+        }
+
+        for(var i = 0; i < mris.length; i++) {
+            mris[i].SmallestPixelValueInSeries = 0;
+            mris[i].LargestPixelValueInSeries = max;
+        }
+
+        return max;
+    }
+
+    ////    if(true) { //this section works using the buttons, which are still necessary to support for bad, older browsers
+    //        rtdoseInput.addEventListener("change", function (event) {
+    //            convertButton.disabled = true;
+    //            var i = 0;
+    //            var reader = new FileReader();
+    //            reader.onload = function (file) {
+    //                document.getElementById("rtdoseProgress").innerHTML = "Loading RTDose Files: " + (i + 1) + "/" + rtdoseInput.files.length + " (" + Math.round(100*(i+1)/rtdoseInput.files.length)+"%)";
+    //                var arrayBuffer = reader.result;
+    //                var byteArray = new Uint8Array(arrayBuffer);
+    //                var dataSet = new DicomDataSet(byteArray);
+    //
+    //                rtdose[i] = new RTDose(dataSet);
+    //
+    //                if(MaxDose === undefined || rtdose[i].MaxDose > MaxDose) {
+    //                    MaxDose = rtdose[i].MaxDose;
+    //                }
+    //
+    //                i++;
+    //                if (i < rtdoseInput.files.length) {
+    //                    reader.readAsArrayBuffer(ctInput.files.item(i));
+    //                }
+    //            };
+    //            reader.readAsArrayBuffer(rtdoseInput.files.item(0));
+    //            console.log(rtdose);
+    //            //console.log(rtdose[0].getValueAt(0, 0, 0));
+    ////        console.log(rtdose[0].getValueAt(0.1, 0.1, 0.1));
+    //            convertButton.disabled = false;
+    //        }, false);
+    //
+    //        var mriInput = document.getElementById("mriInput");
+    //        mriInput.addEventListener("change", function (event) {
+    //            convertButton.disabled = true;
+    //            var i = 0;
+    //            var mriReader = new FileReader();
+    //            mriReader.readAsArrayBuffer(mriInput.files.item(i));
+    //            mriReader.onload = function (file) {
+    //                document.getElementById("mriProgress").innerHTML = "Loading Image Files: " + (i + 1) + "/" + mriInput.files.length + " (" + Math.round(100*(i+1)/mriInput.files.length)+"%)";
+    //                var arrayBuffer = mriReader.result;
+    //                var byteArray = new Uint8Array(arrayBuffer);
+    //                var dataSet = new DicomDataSet(byteArray);
+    //                images[i] = new Image(dataSet);
+    //                //some testing code
+    ////
+    ////                images[i].dataSet.setString("x12345678", "UI", "1.2.3.4.5.6.7.8.9");
+    ////
+    ////                var newDataSet = new DicomDataSet(images[i].dataSet.save());
+    ////                var newMri = new Image(newDataSet);
+    ////                console.log(newMri);
+    //                //end testing code
+    //
+    //                i++;
+    //
+    //                if (i < mriInput.files.length) {
+    //                    mriReader.readAsArrayBuffer(mriInput.files.item(i));
+    //                }
+    //                else {
+    //                    images.sort(function(a, b) {
+    //                        return a.SliceLocation - b.SliceLocation;
+    //                    });
+    //                    console.log(images);
+    //
+    //                    convertButton.disabled = false;
+    //                }
+    //            };
+    //        }, false);
+
+    //    }
+</script>
+</html>

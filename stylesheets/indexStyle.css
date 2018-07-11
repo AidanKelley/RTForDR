@@ -1,0 +1,124 @@
+/*copy pasted from https://medicine.wustl.edu/wp-content/themes/medicine/style.css*/
+html {
+    -ms-text-size-adjust: 100%;
+    -webkit-text-size-adjust: 100%;
+}
+
+body {
+    font-family: 'Open Sans', sans-serif;
+    font-size: 18px;
+    font-weight: normal;
+    color: #333;
+    margin: 0;
+}
+
+a {
+    color: #990000;
+    text-decoration: none;
+}
+
+a:hover {
+    color: #717171;
+}
+
+h1 {
+    font-family: Georgia, serif;
+    font-weight: normal;
+    font-size: 35px;
+    margin-bottom: 30px;
+}
+
+h2 {
+    font-size: 21px;
+    font-weight: 600;
+    margin-top: 30px;
+    margin-bottom: 15px;
+}
+
+h3 {
+    font-size: 18px;
+    font-weight: 600;
+    margin-top: 36px;
+    margin-bottom: 15px;
+}
+
+h4 {
+    font-weight: 600;
+    font-size: 16px;
+    margin-top: 30px;
+    margin-bottom: 15px;
+}
+
+h5 {
+    margin: 0;
+    color: #900;
+    font-weight: normal;
+    font-size: 18px;
+    font-family: Georgia, Times, serif;
+    line-height: 26px;
+}
+
+h6 {
+    font-weight: bold;
+    font-family: Georgia, Times, serif;
+}
+
+
+
+/*end copy paste*/
+#header {
+    border-top: #72121b 5px solid;
+    background: #a51417;
+    width: 100%;
+    height: 44px;
+}
+
+#wusm-logo {
+    height: 27px;
+    margin: 7px 0 10px 7vw;
+}
+
+#header-middle {
+    vertical-align: top;
+    background-image: url(https://webtheme.wustl.edu/wp-content/themes/wutheme_hoyt/images/header-shield.svg);
+    background-position-y: center;
+    background-position-x: 70px;
+    background-repeat: no-repeat;
+    width: 100%;
+    min-height: 135px;
+    /*line-height: 100px;*/
+    padding-top: 0;
+}
+
+#header-text {
+    height: inherit;
+    position: relative;
+    margin-left: 11vw;
+    margin-top: 47.5px;
+    vertical-align: center;
+    float:left;
+    font-family: Georgia, serif;
+    font-weight: normal;
+    font-size: 35px;
+}
+
+#header-bottom {
+    width: 100%;
+    height: 50px;
+    background-color: #555;
+}
+
+#content {
+    margin: 35px 7vw 7vw 7vw;
+}
+
+#file-counters {
+    height: 126px;
+    margin-bottom: 35px;
+}
+#bottom-footer {
+    background: #a51417;
+    height: 44px;
+    width: 100%;
+    border-top: #72121b 5px solid;
+}

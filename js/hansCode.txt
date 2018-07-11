@@ -1,0 +1,520 @@
+using System;
+using System.IO;
+using System.Collections;
+using System.Collections.Generic;
+using System.Linq;
+using System.Runtime.InteropServices;
+using System.Text;
+using Dicom;
+using Dicom.Imaging;
+using Dicom.IO.Buffer;
+using Dicom.Media;
+
+// Error logging codes
+enum Errors {
+    NO_ERR,                            // no errors
+    ERR_UNKNOWN,                    // some unknown error
+    ERR_CREATE_OUTDIR,                // error creating output directory
+    ERR_CONFIG_WIN_VALUES,            // error in reading config file WindowScale
+    ERR_NO_DOSE_SANITY,                // missing dose sanity values
+    ERR_CONFIG_DIRECTORIES,            // error reading input/output directories
+    ERR_INPUT_FILE,                    // error processing input dicom file
+    ERR_NO_STUDY_UID,                // missing study instance uid
+    ERR_MISSING_IMGS,                // missing images in CT series
+    ERR_UNEVEN_SLICE_THICKNESS,        // CT image slice thicknesses inconsistent
+    ERR_NO_DOSE,                    // no dose images found
+    ERR_WRONG_DOSE_UNITS,            // dose units are not in Gy or cGy
+    ERR_BAD_DOSE_BITS,                // dose image not in 8, 16, 24, or 32 bit format
+    ERR_INTERP_DOSE,                // error interpolating dose
+    ERR_FAILED_SANITY,                // max dose failed sanity check
+    ERR_COPY_CT,                    // error copying CT images
+    ERR_DOSE_OUTPUT,                // error saving output dose
+    ERR_BAD_CT_BITS,                // CT image not in 8, 16, 24, or 32 bit format
+    ERR_FUSED_OUTPUT,                // error saving fused output
+}
+
+namespace ConvertDose {
+    class Program {
+        private static string outdir="";
+        public static void Main(string[] args) {
+            try {
+                // Read config file for info on input/output directory
+                double win_center=0, win_width=0;
+                double san_max_dose=0, san_min_dose=0;
+                string cfile=Path.Combine(Directory.GetCurrentDirectory(),"Config_home.ini");
+                IniFile ini=new IniFile(cfile);
+                string indir=ini.IniReadValue("Location","Input");
+                outdir=ini.IniReadValue("Location","Output");
+                try {
+                    System.IO.Directory.CreateDirectory(outdir);
+                } catch (Exception) {
+                    log_error(Errors.ERR_CREATE_OUTDIR);
+                }
+                if (!Directory.Exists(indir) || !Directory.Exists(outdir))
+                    log_error(Errors.ERR_CONFIG_DIRECTORIES);
+                try {
+                    win_center=Convert.ToDouble(ini.IniReadValue("WindowScale","Center"));
+                    win_width=Convert.ToDouble(ini.IniReadValue("WindowScale","Width"));
+                } catch (Exception) {
+                    log_error(Errors.ERR_CONFIG_WIN_VALUES);
+                }
+                try {
+                    san_max_dose=Convert.ToDouble(ini.IniReadValue("Dose","Max"));
+                    san_min_dose=Convert.ToDouble(ini.IniReadValue("Dose","Min"));
+                } catch (Exception) {
+                    log_error(Errors.ERR_CONFIG_WIN_VALUES);
+                }
+                string[] files=Directory.GetFiles(@indir,"*.*");
+
+                // Read dicom file headers to find dose dicom files first
+                string study_uid="";
+                List<DicomFile> dose_info=new List<DicomFile>();
+                Console.WriteLine("Processing Input Directory: " +indir);
+                for (int i=0; i<files.Length; i++) {
+                    try {
+                        DicomFile dcm=DicomFile.Open(@files[i]);
+                        string mod=dcm.Dataset.Get<string>(DicomTag.Modality);
+                        if (String.Equals(mod,"RTDOSE",StringComparison.OrdinalIgnoreCase) &&
+                            String.Equals(dcm.Dataset.Get<string>(DicomTag.DoseSummationType),"FRACTION",StringComparison.OrdinalIgnoreCase)) {
+                            if (String.Equals(study_uid,"")) {
+                                study_uid=dcm.Dataset.Get<string>(DicomTag.StudyInstanceUID);
+                                if (String.Equals(study_uid,"",StringComparison.OrdinalIgnoreCase))
+                                    log_error(Errors.ERR_NO_STUDY_UID);
+                            } else if (!String.Equals(study_uid,dcm.Dataset.Get<string>(DicomTag.StudyInstanceUID),StringComparison.OrdinalIgnoreCase))
+                                continue;
+                            dose_info.Add(dcm);
+                        }
+                    } catch (Dicom.DicomFileException) {}
+                }
+                // Prints out the number of dose files
+                Console.WriteLine("NUM Dose: "+dose_info.Count);
+                if (dose_info.Count==0)
+                    log_error(Errors.ERR_NO_DOSE);
+
+                // Read dicom files for CT images
+                List<DicomFile> ct_info=new List<DicomFile>();
+                List<double> ct_slice=new List<double>();
+                List<int> inst_num=new List<int>();
+                byte[] buf;
+                for (int i=0; i<files.Length; i++) {
+                    try {
+                        DicomFile dcm=DicomFile.Open(@files[i]);
+                        string mod=dcm.Dataset.Get<string>(DicomTag.Modality);
+                        if (String.Equals(mod,"CT",StringComparison.OrdinalIgnoreCase)) {
+                            // Ignore files where study instance uid doesn't match
+                            if (!String.Equals(study_uid,dcm.Dataset.Get<string>(DicomTag.StudyInstanceUID),StringComparison.OrdinalIgnoreCase))
+                                continue;
+                            ct_info.Add(dcm);
+                            inst_num.Add(dcm.Dataset.Get<int>(DicomTag.InstanceNumber));
+                            double[] ploc=dcm.Dataset.Get<double[]>(DicomTag.ImagePositionPatient);
+                            ct_slice.Add(ploc[2]);
+                        }
+                    } catch (Dicom.DicomFileException) {}
+                }
+
+                // Make sure all CT images are present
+                int ct_count=ct_slice.Count;
+                int minI=ct_slice.IndexOf(ct_slice.Min());
+                Console.WriteLine("NUM CT: "+ct_count);
+                if (inst_num.Max()-inst_num.Min()+1!=ct_count)
+                    log_error(Errors.ERR_MISSING_IMGS);
+
+                // Get CT location info
+                double[] ct_pos=ct_info[minI].Dataset.Get<double[]>(DicomTag.ImagePositionPatient);
+                double[] ct_space=ct_info[minI].Dataset.Get<double[]>(DicomTag.PixelSpacing);
+                int ct_width=ct_info[minI].Dataset.Get<int>(DicomTag.Columns);
+                int ct_height=ct_info[minI].Dataset.Get<int>(DicomTag.Rows);
+                int ct_pix=ct_width*ct_height;
+                ct_slice.Sort();
+                double slice_thickness=ct_info[minI].Dataset.Get<double>(DicomTag.SliceThickness);
+                for (int i=1; i<ct_count; i++) {
+                    if (Math.Abs(ct_slice[i]-ct_slice[i-1]-slice_thickness)>0.01)
+                        log_error(Errors.ERR_UNEVEN_SLICE_THICKNESS);
+                }
+
+                // Initialize new variables
+                double[,] dose=new double[ct_slice.Count,ct_pix];
+                double[] cloc=new double[3];
+                double[] dloc=new double[3];
+                double[] dval=new double[8];
+                double[] minV=new double[ct_count+1];
+                double[] maxV=new double[ct_count+1];
+                for (int i=0; i<ct_count+1; i++) {
+                    minV[i]=double.PositiveInfinity;
+                    maxV[i]=0;
+                }
+
+                // For mulitiple dose files, sum them up
+                Console.WriteLine("Processing Dose ...");
+                for (int d=0; d<dose_info.Count; d++) {
+                    // Read dose image
+                    DicomImage tmp_img=new DicomImage(@dose_info[d].File.Name);
+                    int bitAlloc=dose_info[d].Dataset.Get<int>(DicomTag.BitsAllocated);
+                    int nframes=tmp_img.NumberOfFrames;
+                    int dose_width=tmp_img.Width;
+                    int dose_height=tmp_img.Height;
+                    int npix=dose_width*dose_height;
+                    double[,] dose_img=new double[nframes,npix];
+                    double dose_scale=0;
+                    string scale=dose_info[d].Dataset.Get<string>(DicomTag.DoseUnits);
+                    if (String.Equals(scale,"GY",StringComparison.OrdinalIgnoreCase))
+                        dose_scale=100;
+                    else if (String.Equals(scale,"cGY",StringComparison.OrdinalIgnoreCase))
+                        dose_scale=1;
+                    else
+                        log_error(Errors.ERR_WRONG_DOSE_UNITS,dose_info[d].File.Name);
+
+                    // Convert raw dose data into 3D dose volume
+                    for (int f=0; f<nframes; f++) {
+                        buf=tmp_img.PixelData.GetFrame(f).Data;
+                        for (int i=0; i<npix; i++) {
+                            if (bitAlloc==32)
+                                dose_img[f,i]=(double)(buf[i*4+3]<<24|buf[i*4+2]<<16|buf[i*4+1]<<8|buf[i*4])*dose_info[d].Dataset.Get<double>(DicomTag.DoseGridScaling)*dose_scale;
+                            else if (bitAlloc==24)
+                                dose_img[f,i]=(double)(buf[i*4+2]<<16|buf[i*4+1]<<8|buf[i*4])*dose_info[d].Dataset.Get<double>(DicomTag.DoseGridScaling)*dose_scale;
+                            else if (bitAlloc==16)
+                                dose_img[f,i]=(double)(buf[i*2+1]<<8|buf[i*2])*dose_info[d].Dataset.Get<double>(DicomTag.DoseGridScaling)*dose_scale;
+                            else if (bitAlloc==8)
+                                dose_img[f,i]=(double)buf[i]*dose_info[d].Dataset.Get<double>(DicomTag.DoseGridScaling)*dose_scale;
+                            else
+                                log_error(Errors.ERR_BAD_DOSE_BITS,dose_info[d].File.Name);
+                        }
+                    }
+
+                    try {
+                        // Line up dose location
+                        double[] dose_pos=dose_info[d].Dataset.Get<double[]>(DicomTag.ImagePositionPatient);
+                        double[] dose_space=dose_info[d].Dataset.Get<double[]>(DicomTag.PixelSpacing);
+                        double[] dose_slice=dose_info[d].Dataset.Get<double[]>(DicomTag.GridFrameOffsetVector);
+                        double[] dspace={dose_space[0],dose_space[1],0};
+                        for (int i=0; i<dose_slice.Length; i++)
+                            dose_slice[i]+=dose_pos[2];
+
+                        // For each point on CT, find interpolated dose point
+                        for (int z=0; z<ct_slice.Count; z++) {
+                            for (int c=0; c<ct_width; c++) {
+                                for (int r=0; r<ct_height; r++) {
+                                    // cloc: location on CT
+                                    int idx=c*ct_height+r;
+                                    cloc[0]=ct_pos[0]+r*ct_space[0];
+                                    cloc[1]=ct_pos[1]+c*ct_space[1];
+                                    cloc[2]=(double)ct_slice[z];
+                                    // vs: dose location index
+                                    int vx=(int)((cloc[0]-dose_pos[0])/dose_space[0]);
+                                    int vy=(int)((cloc[1]-dose_pos[1])/dose_space[1]);
+                                    int vz=Array.BinarySearch(dose_slice,cloc[2]);
+                                    vz=(vz<-1)?(-vz-2):(vz-1);
+                                    if (vx<0||vx>dose_width-2||vy<0||vy>dose_height-2||vz<0||vz>dose_slice.Length-2) {
+                                        dose[z,idx]=0;
+                                        minV[z]=Math.Min(minV[z],0);
+                                    }
+                                    else {
+                                        // dloc: location on dose
+                                        dloc[0]=dose_pos[0]+vx*dose_space[0];
+                                        dloc[1]=dose_pos[1]+vy*dose_space[1];
+                                        dloc[2]=dose_slice[vz];
+                                        dspace[2]=dose_slice[vz+1]-dose_slice[vz];
+                                        int count=0;
+                                        // dval: 8 corner dose values
+                                        for (int i=0; i<2; i++)
+                                            for (int j=0; j<2; j++)
+                                                for (int k=0; k<2; k++)
+                                                    dval[count++]=dose_img[vz+i,(vy+j)*dose_width+vx+k];
+                                        dose[z,idx]+=interp(dloc,dspace,dval,cloc);
+                                        // Get min and max values for use in dicom writing later
+                                        if (d==dose_info.Count-1) {
+                                            minV[z]=Math.Min(minV[z],dose[z,idx]);
+                                            minV[ct_count]=Math.Min(minV[ct_count],dose[z,idx]);
+                                            maxV[z]=Math.Max(maxV[z],dose[z,idx]);
+                                            maxV[ct_count]=Math.Max(maxV[ct_count],dose[z,idx]);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } catch (Exception) {
+                        log_error(Errors.ERR_INTERP_DOSE,dose_info[d].File.Name);
+                    }
+                    log_success("INPUT DOSE",dose_info[d].File.Name);
+                }
+
+                // Assign new UIDs
+                string uid_root="1.4.6.1.4.1.1215.100.1.";
+                Random rand=new Random();
+                string seriesUID1=uid_root+(long)rand.Next()*(long)rand.Next();
+                string seriesUID2=uid_root+(long)rand.Next()*(long)rand.Next();
+                string impclassUID1=uid_root+(long)rand.Next()*(long)rand.Next();
+                string impclassUID2=uid_root+(long)rand.Next()*(long)rand.Next();
+                double min_dose=minV[ct_count];
+                double max_dose=maxV[ct_count];
+                if (min_dose/100<san_min_dose || max_dose/100>san_max_dose)
+                    log_error(Errors.ERR_FAILED_SANITY);
+                string wcenter=(max_dose*win_center).ToString();
+                string wwidth=(max_dose*win_width).ToString();
+                double[,] cbar=get_colorbar();
+
+                // Create output dir
+                outdir=outdir+"\\"+ct_info[minI].Dataset.Get<string>(DicomTag.PatientID)+"_"+ct_info[minI].Dataset.Get<string>(DicomTag.PatientName);
+                try {
+                    System.IO.Directory.CreateDirectory(outdir);
+                } catch (Exception) {
+                    log_error(Errors.ERR_CREATE_OUTDIR);
+                }
+
+                // Output new dicoms
+                Console.WriteLine("Outputing New Dicoms ...");
+                for (int slice=0; slice<ct_count; slice++) {
+                    DicomFile dcm=ct_info[slice];
+                    string studyDes=dcm.Dataset.Get<string>(DicomTag.StudyDescription);
+                    string[] fname=dcm.File.Name.Split(new char[]{'\\'});
+                    string ctfile=indir+"\\"+fname[fname.Length-1];
+                    string out_ctfile=outdir+"\\"+fname[fname.Length-1];
+                    string out_dosefile=outdir+"\\DOSE_"+fname[fname.Length-1];
+                    string out_fusedfile=outdir+"\\FUSED_CTDOSE_"+fname[fname.Length-1];
+
+                    // Copy original CT dicom
+                    try {
+                        System.IO.File.Copy(ctfile,out_ctfile,true);
+                        log_success("OUTPUT CT",out_ctfile);
+                    } catch (Exception) {
+                        log_error(Errors.ERR_COPY_CT,out_ctfile);
+                    }
+
+                    int count=0;
+                    int z=ct_slice.BinarySearch(dcm.Dataset.Get<double>(DicomTag.ImagePositionPatient,2));
+                    double v1=dcm.Dataset.Get<double>(DicomTag.WindowCenter)-dcm.Dataset.Get<double>(DicomTag.WindowWidth)-dcm.Dataset.Get<double>(DicomTag.RescaleIntercept);
+                    double v2=dcm.Dataset.Get<double>(DicomTag.WindowCenter)+dcm.Dataset.Get<double>(DicomTag.WindowWidth)-dcm.Dataset.Get<double>(DicomTag.RescaleIntercept);
+
+                    // Create dose slice image
+                    try {
+                        byte[] doseval;
+                        byte[] new_dose=new byte[ct_pix*2];
+                        for (int i=0; i<ct_pix; i++) {
+                            doseval=BitConverter.GetBytes((UInt16)dose[z,i]);
+                            new_dose[count++]=doseval[0];
+                            new_dose[count++]=doseval[1];
+                        }
+
+                        // Add new dose image
+                        MemoryByteBuffer buffer=new MemoryByteBuffer(new_dose);
+                        DicomPixelData pixdata=DicomPixelData.Create(dcm.Dataset,true);
+                        pixdata.PhotometricInterpretation=Dicom.Imaging.PhotometricInterpretation.Monochrome2;
+                        pixdata.BitsStored=16;
+                        pixdata.BitsAllocated=16;
+                        pixdata.SamplesPerPixel=1;
+                        pixdata.HighBit=15;
+                        pixdata.PixelRepresentation=0;
+                        pixdata.PlanarConfiguration=0;
+                        pixdata.AddFrame(buffer);
+
+                        // Update new dose header tags
+                        string sopuid=uid_root+(long)rand.Next()*(long)rand.Next();
+                        dcm.Dataset.Add(DicomTag.SeriesInstanceUID,seriesUID1);
+                        dcm.Dataset.Add(DicomTag.ImplementationClassUID,impclassUID1);
+                        dcm.Dataset.Add(DicomTag.MediaStorageSOPInstanceUID,sopuid);
+                        dcm.Dataset.Add(DicomTag.SOPInstanceUID,sopuid);
+                        dcm.Dataset.Add(DicomTag.SmallestImagePixelValue,(ushort)minV[z]);
+                        dcm.Dataset.Add(DicomTag.LargestImagePixelValue,(ushort)maxV[z]);
+                        dcm.Dataset.Add(DicomTag.WindowCenter,wcenter);
+                        dcm.Dataset.Add(DicomTag.WindowWidth,wwidth);
+                        dcm.Dataset.Add(DicomTag.RescaleIntercept,"0");
+                        dcm.Dataset.Add(DicomTag.RescaleSlope,"1");
+
+                        // Write new dose dicoms
+                        dcm.Save(out_dosefile);
+                        log_success("OUTPUT DOSE",out_dosefile);
+                    } catch (Exception) {
+                        log_error(Errors.ERR_DOSE_OUTPUT,out_dosefile);
+                    }
+
+                    // Fuse CT/dose
+                    try {
+                        DicomImage tmp_img=new DicomImage(@ctfile);
+                        buf=tmp_img.PixelData.GetFrame(0).Data;
+                        int bitAlloc=dcm.Dataset.Get<int>(DicomTag.BitsAllocated);
+                        byte[] fused_img=new byte[ct_pix*3+(ct_pix%2)];
+                        double ct_val=0;
+                        count=0;
+                        for (int i=0; i<ct_pix; i++) {
+                            // Convert CT value to 0-1
+                            if (bitAlloc==32)
+                                ct_val=(double)(buf[i*4+3]<<24|buf[i*4+2]<<16|buf[i*4+1]<<8|buf[i*4]);
+                            else if (bitAlloc==24)
+                                ct_val=(double)(buf[i*4+2]<<16|buf[i*4+1]<<8|buf[i*4]);
+                            else if (bitAlloc==16)
+                                ct_val=(double)(buf[i*2+1]<<8|buf[i*2]);
+                            else if (bitAlloc==8)
+                                ct_val=(double)buf[i];
+                            else
+                                log_error(Errors.ERR_BAD_CT_BITS,ctfile);
+                            ct_val=(Math.Min(Math.Max(ct_val,v1),v2)-v1)/(v2-v1);
+                            // Convert dose value to color;
+                            int idx=(int)(dose[z,i]/max_dose*95.9999);
+                            // Fuse the two
+                            for (int j=0; j<3; j++)
+                                fused_img[count++]=(byte)(((1-ct_val)*cbar[idx,j]*.6+ct_val)*255);
+                        }
+
+                        // Add colorbar to image
+                        for (int i=0; i<cbar.GetLength(0); i++) {
+                            count=((ct_height-cbar.GetLength(0)-4+i)*ct_width+4)*3;
+                            for (int j=0; j<20; j++)
+                                for (int k=0; k<3; k++)
+                                    fused_img[count++]=(byte)(cbar[cbar.GetLength(0)-i-1,k]*255);
+                        }
+
+                        // Add max dose value to image
+                        string dstr=(max_dose/100).ToString("F1");
+                        for (int i=0; i<12; i++) {
+                            count=((ct_height-cbar.GetLength(0)-17+i)*ct_width+2)*3;
+                            for (int j=0; j<(dstr.Length*8+4)*3; j++)
+                                fused_img[count++]=0;
+                        }
+                        for (int n=0; n<dstr.Length; n++) {
+                            byte[] ddigit=get_digits(dstr[n]);
+                            int didx=0;
+                            for (int i=0; i<10; i++) {
+                                count=((ct_height-cbar.GetLength(0)-16+i)*ct_width+3+8*n)*3;
+                                for (int j=0; j<8; j++) {
+                                    for (int k=0; k<3; k++)
+                                        fused_img[count++]=(byte)(255.0*ddigit[didx]);
+                                    didx++;
+                                }
+                            }
+                        }
+
+                        // Every 2 byte pair gets flipped for some reason
+                        for (int i=0; i<fused_img.Length; i+=2) {
+                            byte t=fused_img[i];
+                            fused_img[i]=fused_img[i+1];
+                            fused_img[i+1]=t;
+                        }
+
+                        // Add new fused CT/dose image
+                        MemoryByteBuffer buffer=new MemoryByteBuffer(fused_img);
+                        DicomPixelData pixdata=DicomPixelData.Create(dcm.Dataset,true);
+                        pixdata.PhotometricInterpretation=Dicom.Imaging.PhotometricInterpretation.Rgb;
+                        pixdata.BitsStored=8;
+                        pixdata.BitsAllocated=8;
+                        pixdata.SamplesPerPixel=3;
+                        pixdata.HighBit=7;
+                        pixdata.PixelRepresentation=0;
+                        pixdata.PlanarConfiguration=0;
+                        pixdata.AddFrame(buffer);
+
+                        // Update new dose header tags
+                        string sopuid=uid_root+(long)rand.Next()*(long)rand.Next();
+                        dcm.Dataset.Add(DicomTag.SeriesInstanceUID,seriesUID2);
+                        dcm.Dataset.Add(DicomTag.ImplementationClassUID,impclassUID2);
+                        dcm.Dataset.Add(DicomTag.MediaStorageSOPInstanceUID,sopuid);
+                        dcm.Dataset.Add(DicomTag.SOPInstanceUID,sopuid);
+                        dcm.Dataset.Add(DicomTag.WindowCenter,"128");
+                        dcm.Dataset.Add(DicomTag.WindowWidth,"255");
+                        dcm.Dataset.Add(DicomTag.SmallestImagePixelValue,(ushort)0);
+                        dcm.Dataset.Add(DicomTag.LargestImagePixelValue,(ushort)255);
+
+                        // Write new CT/Dose dicoms
+                        dcm.Save(out_fusedfile);
+                        log_success("OUTPUT FUSED",out_fusedfile);
+                    } catch (Exception) {
+                        log_error(Errors.ERR_FUSED_OUTPUT,out_fusedfile);
+                    }
+                }
+
+                // Done
+                log_error(Errors.NO_ERR);
+            } catch (Exception) {
+                log_error(Errors.ERR_UNKNOWN);
+            }
+        }
+
+        // Trilinear interpolation
+        private static double interp(double[] vloc, double[] vspace, double[] v, double[] eloc) {
+            double x=(eloc[2]-vloc[2])/vspace[2];
+            double y=(eloc[1]-vloc[1])/vspace[1];
+            double z=(eloc[0]-vloc[0])/vspace[0];
+            if (x<0||x>1||y<0||y>1||z<0||z>1)
+                return 0;
+            return v[0]*(1-x)*(1-y)*(1-z)+v[4]*x*(1-y)*(1-z)+v[2]*(1-x)*y*(1-z)
+                +v[1]*(1-x)*(1-y)*z+v[5]*x*(1-y)*z+v[3]*(1-x)*y*z
+                +v[6]*x*y*(1-z)+v[7]*x*y*z;
+        }
+
+        // Colorbar
+        private static double[,] get_colorbar() {
+            return new double[,]
+            {{0,0,0},{0.0281,0,0},{0.0561,0,0},{0.0842,0,0},{0.1123,0,0},{0.1404,0,0},{0.1684,0,0},{0.1965,0,0},{0.2246,0,0},{0.2526,0,0},{0.2807,0,0},{0.3088,0,0},
+                {0.3368,0,0},{0.3649,0,0},{0.3930,0,0},{0.4211,0,0},{0.4491,0,0},{0.4772,0,0},{0.5053,0,0},{0.5333,0,0},{0.5614,0,0},{0.5895,0,0},{0.6175,0,0},{0.6456,0,0},
+                {0.6737,0,0},{0.7018,0,0},{0.7298,0,0},{0.7579,0,0},{0.7860,0,0},{0.8140,0,0},{0.8421,0,0},{0.8702,0,0},{0.8982,0,0},{0.9263,0,0},{0.9544,0,0},{0.9825,0,0},
+                {1,0.0105,0},{1,0.0386,0},{1,0.0667,0},{1,0.0947,0},{1,0.1228,0},{1,0.1509,0},{1,0.1789,0},{1,0.2070,0},{1,0.2351,0},{1,0.2632,0},{1,0.2912,0},{1,0.3193,0},
+                {1,0.3474,0},{1,0.3754,0},{1,0.4035,0},{1,0.4316,0},{1,0.4596,0},{1,0.4877,0},{1,0.5158,0},{1,0.5439,0},{1,0.5719,0},{1,0.6000,0},{1,0.6281,0},{1,0.6561,0},
+                {1,0.6842,0},{1,0.7123,0},{1,0.7404,0},{1,0.7684,0},{1,0.7965,0},{1,0.8246,0},{1,0.8526,0},{1,0.8807,0},{1,0.9088,0},{1,0.9368,0},{1,0.9649,0},{1,0.9930,0},
+                {1,1,0.0316},{1,1,0.0737},{1,1,0.1158},{1,1,0.1579},{1,1,0.2000},{1,1,0.2421},{1,1,0.2842},{1,1,0.3263},{1,1,0.3684},{1,1,0.4105},{1,1,0.4526},{1,1,0.4947},
+                {1,1,0.5368},{1,1,0.5789},{1,1,0.6211},{1,1,0.6632},{1,1,0.7053},{1,1,0.7474},{1,1,0.7895},{1,1,0.8316},{1,1,0.8737},{1,1,0.9158},{1,1,0.9579},{1,1,1}};
+        }
+
+        // Font for number display
+        private static byte[] get_digits(char d) {
+            switch (d) {
+                    case '0': return new byte[]{0,0,1,1,1,1,1,1,0,0,1,1,1,1,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,1,1,1,1,0,0,1,1,1,1,1,1};
+                    case '1': return new byte[]{0,0,0,0,0,0,1,1,0,0,0,0,0,0,1,1,0,0,0,0,0,0,1,1,0,0,0,0,0,0,1,1,0,0,0,0,0,0,1,1,0,0,0,0,0,0,1,1,0,0,0,0,0,0,1,1,0,0,0,0,0,0,1,1,0,0,0,0,0,0,1,1,0,0,0,0,0,0,1,1};
+                    case '2': return new byte[]{0,0,1,1,1,1,1,1,0,0,1,1,1,1,1,1,0,0,0,0,0,0,1,1,0,0,0,0,0,0,1,1,0,0,1,1,1,1,1,1,0,0,1,1,1,1,1,1,0,0,1,1,0,0,0,0,0,0,1,1,0,0,0,0,0,0,1,1,1,1,1,1,0,0,1,1,1,1,1,1};
+                    case '3': return new byte[]{0,0,1,1,1,1,1,1,0,0,1,1,1,1,1,1,0,0,0,0,0,0,1,1,0,0,0,0,0,0,1,1,0,0,1,1,1,1,1,1,0,0,1,1,1,1,1,1,0,0,0,0,0,0,1,1,0,0,0,0,0,0,1,1,0,0,1,1,1,1,1,1,0,0,1,1,1,1,1,1};
+                    case '4': return new byte[]{0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,1,1,1,1,0,0,1,1,1,1,1,1,0,0,0,0,0,0,1,1,0,0,0,0,0,0,1,1,0,0,0,0,0,0,1,1,0,0,0,0,0,0,1,1};
+                    case '5': return new byte[]{0,0,1,1,1,1,1,1,0,0,1,1,1,1,1,1,0,0,1,1,0,0,0,0,0,0,1,1,0,0,0,0,0,0,1,1,1,1,1,1,0,0,1,1,1,1,1,1,0,0,0,0,0,0,1,1,0,0,0,0,0,0,1,1,0,0,1,1,1,1,1,1,0,0,1,1,1,1,1,1};
+                    case '6': return new byte[]{0,0,1,1,1,1,1,1,0,0,1,1,1,1,1,1,0,0,1,1,0,0,0,0,0,0,1,1,0,0,0,0,0,0,1,1,1,1,1,1,0,0,1,1,1,1,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,1,1,1,1,0,0,1,1,1,1,1,1};
+                    case '7': return new byte[]{0,0,1,1,1,1,1,1,0,0,1,1,1,1,1,1,0,0,0,0,0,0,1,1,0,0,0,0,0,0,1,1,0,0,0,0,0,0,1,1,0,0,0,0,0,0,1,1,0,0,0,0,0,0,1,1,0,0,0,0,0,0,1,1,0,0,0,0,0,0,1,1,0,0,0,0,0,0,1,1};
+                    case '8': return new byte[]{0,0,1,1,1,1,1,1,0,0,1,1,1,1,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,1,1,1,1,0,0,1,1,1,1,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,1,1,1,1,0,0,1,1,1,1,1,1};
+                    case '9': return new byte[]{0,0,1,1,1,1,1,1,0,0,1,1,1,1,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,1,1,1,1,0,0,1,1,1,1,1,1,0,0,0,0,0,0,1,1,0,0,0,0,0,0,1,1,0,0,0,0,0,0,1,1,0,0,0,0,0,0,1,1};
+                    default: return new byte[]{0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,0,0,0,0,0,0,1,1,0,0};
+            }
+        }
+
+        // Log error
+        private static void log_error(Errors e) {
+            if (e!=Errors.NO_ERR)
+                Console.WriteLine(e);
+
+            Console.Write("Done. Press any key to continue ...");
+            Console.ReadKey(true);
+            Environment.Exit(0);
+        }
+
+        // Log errors with files
+        private static void log_error(Errors e,string fname) {
+            Console.WriteLine(e+": "+fname);
+            Console.Write("Done. Press any key to continue ...");
+            Console.ReadKey(true);
+            Environment.Exit(0);
+        }
+
+        // Log successes
+        private static void log_success(string type,string fname) {
+            Console.WriteLine("SUCESS - "+type+": "+fname);
+        }
+
+        // Remove outputs in case of errors
+        private static void cleanup() {
+
+        }
+    }
+
+    // Used for reading config file
+    public class IniFile {
+        public string path;
+        [DllImport("kernel32")]
+        private static extern long WritePrivateProfileString(string section,string key,string val,string filePath);
+        [DllImport("kernel32")]
+        private static extern int GetPrivateProfileString(string section,string key,string def,StringBuilder retVal,int size,string filePath);
+
+        public IniFile(string INIPath) {
+            path = INIPath;
+        }
+
+        public string IniReadValue(string Section,string Key) {
+            StringBuilder temp = new StringBuilder(255);
+            int i = GetPrivateProfileString(Section,Key,"",temp,255, this.path);
+            return temp.ToString();
+        }
+    }
+}
